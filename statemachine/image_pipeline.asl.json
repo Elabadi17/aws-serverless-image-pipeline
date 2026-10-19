@@ -1,0 +1,247 @@
+{
+  "Comment": "Image processing workflow: validate -> (thumbnail || watermark) -> record -> notify. Rendered by Terraform templatefile().",
+  "StartAt": "MarkProcessing",
+  "States": {
+    "MarkProcessing": {
+      "Type": "Task",
+      "Comment": "Flip status to PROCESSING and remove the TTL set for pending uploads.",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": { "imageId": { "S.$": "$.imageId" } },
+        "UpdateExpression": "SET #s = :s, processingStartedAt = :t, executionArn = :e REMOVE expiresAt",
+        "ConditionExpression": "attribute_exists(imageId)",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "PROCESSING" },
+          ":t": { "S.$": "$$.State.EnteredTime" },
+          ":e": { "S.$": "$$.Execution.Id" }
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.ThrottlingException", "DynamoDB.InternalServerErrorException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+      "Next": "Validate"
+    },
+
+    "Validate": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${validate_arn}",
+        "Payload": {
+          "imageId.$": "$.imageId",
+          "bucket.$": "$.bucket",
+          "key.$": "$.key",
+          "sizeBytes.$": "$.sizeBytes"
+        }
+      },
+      "ResultSelector": { "metadata.$": "$.Payload" },
+      "ResultPath": "$.validation",
+      "TimeoutSeconds": 90,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        { "ErrorEquals": ["InvalidImageError"], "ResultPath": "$.error", "Next": "RecordRejected" },
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }
+      ],
+      "Next": "ProcessInParallel"
+    },
+
+    "ProcessInParallel": {
+      "Type": "Parallel",
+      "Comment": "Thumbnail and watermarked full-resolution copy are independent, so run them side by side.",
+      "Branches": [
+        {
+          "StartAt": "CreateThumbnail",
+          "States": {
+            "CreateThumbnail": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${thumbnail_arn}",
+                "Payload": { "imageId.$": "$.imageId", "bucket.$": "$.bucket", "key.$": "$.key" }
+              },
+              "OutputPath": "$.Payload",
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ResizeAndWatermark",
+          "States": {
+            "ResizeAndWatermark": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${watermark_arn}",
+                "Payload": { "imageId.$": "$.imageId", "bucket.$": "$.bucket", "key.$": "$.key" }
+              },
+              "OutputPath": "$.Payload",
+              "TimeoutSeconds": 90,
+              "Retry": [
+                {
+                  "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2,
+                  "JitterStrategy": "FULL"
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultSelector": { "thumbnail.$": "$[0]", "full.$": "$[1]" },
+      "ResultPath": "$.outputs",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+      "Next": "RecordSuccess"
+    },
+
+    "RecordSuccess": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": { "imageId": { "S.$": "$.imageId" } },
+        "UpdateExpression": "SET #s = :s, #w = :w, #h = :h, #f = :f, sizeBytes = :b, thumbnailKey = :tk, fullKey = :fk, completedAt = :t",
+        "ExpressionAttributeNames": { "#s": "status", "#w": "width", "#h": "height", "#f": "format" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "COMPLETED" },
+          ":w": { "N.$": "States.Format('{}', $.validation.metadata.width)" },
+          ":h": { "N.$": "States.Format('{}', $.validation.metadata.height)" },
+          ":f": { "S.$": "$.validation.metadata.format" },
+          ":b": { "N.$": "States.Format('{}', $.validation.metadata.sizeBytes)" },
+          ":tk": { "S.$": "$.outputs.thumbnail.key" },
+          ":fk": { "S.$": "$.outputs.full.key" },
+          ":t": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Retry": [
+        {
+          "ErrorEquals": ["DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.ThrottlingException", "DynamoDB.InternalServerErrorException"],
+          "IntervalSeconds": 1,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordFailure" }],
+      "Next": "NotifySuccess"
+    },
+
+    "NotifySuccess": {
+      "Type": "Task",
+      "Comment": "No Catch: a notification failure must not overwrite a COMPLETED status. The execution fails and the alarm fires instead.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "Image processed",
+        "Message.$": "States.Format('Image {} processed. Thumbnail: {} - Full: {}', $.imageId, $.outputs.thumbnail.key, $.outputs.full.key)",
+        "MessageAttributes": { "status": { "DataType": "String", "StringValue": "COMPLETED" } }
+      },
+      "ResultPath": null,
+      "Retry": [{ "ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 3, "BackoffRate": 2 }],
+      "End": true
+    },
+
+    "RecordRejected": {
+      "Type": "Task",
+      "Comment": "User error (not an image, too big, wrong format): not retried, not alarmed.",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": { "imageId": { "S.$": "$.imageId" } },
+        "UpdateExpression": "SET #s = :s, errorType = :et, errorCause = :ec, completedAt = :t",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "REJECTED" },
+          ":et": { "S.$": "$.error.Error" },
+          ":ec": { "S.$": "$.error.Cause" },
+          ":t": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "NotifyRejected"
+    },
+
+    "NotifyRejected": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "Image rejected",
+        "Message.$": "States.Format('Image {} was rejected: {}', $.imageId, $.error.Error)",
+        "MessageAttributes": { "status": { "DataType": "String", "StringValue": "REJECTED" } }
+      },
+      "ResultPath": null,
+      "Next": "Rejected"
+    },
+
+    "Rejected": { "Type": "Succeed" },
+
+    "RecordFailure": {
+      "Type": "Task",
+      "Comment": "System error after retries were exhausted.",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "${table_name}",
+        "Key": { "imageId": { "S.$": "$.imageId" } },
+        "UpdateExpression": "SET #s = :s, errorType = :et, errorCause = :ec, completedAt = :t REMOVE expiresAt",
+        "ExpressionAttributeNames": { "#s": "status" },
+        "ExpressionAttributeValues": {
+          ":s": { "S": "FAILED" },
+          ":et": { "S.$": "$.error.Error" },
+          ":ec": { "S.$": "$.error.Cause" },
+          ":t": { "S.$": "$$.State.EnteredTime" }
+        }
+      },
+      "ResultPath": null,
+      "Next": "NotifyFailure"
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topic_arn}",
+        "Subject": "Image processing failed",
+        "Message.$": "States.Format('Image {} failed: {}', $.imageId, $.error.Error)",
+        "MessageAttributes": { "status": { "DataType": "String", "StringValue": "FAILED" } }
+      },
+      "ResultPath": null,
+      "Next": "ProcessingFailed"
+    },
+
+    "ProcessingFailed": {
+      "Type": "Fail",
+      "Error": "ImageProcessingFailed",
+      "Cause": "See the RecordFailure step input for the original error."
+    }
+  }
+}

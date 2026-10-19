@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and adjust. terraform.tfvars is git-ignored.
+aws_region         = "eu-west-3"
+project_name       = "img-pipeline"
+environment        = "dev"
+notification_email = "you@example.com"
+allowed_origins    = ["*"]
+watermark_text     = "© Your Name"
+max_upload_mb      = 20

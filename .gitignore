@@ -1,0 +1,24 @@
+# Build artefacts
+build/
+*.zip
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Terraform
+terraform/.terraform/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+!terraform/*.tfvars.example
+terraform/crash.log
+# Do commit terraform/.terraform.lock.hcl after your first `terraform init`.
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+aws

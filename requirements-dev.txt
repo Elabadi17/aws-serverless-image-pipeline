@@ -1,0 +1,6 @@
+# Local development and tests only. At runtime, boto3 comes from the Lambda
+# Python runtime and Pillow from the layer built by scripts/build.sh.
+pillow>=12.0
+boto3>=1.35
+moto[s3,dynamodb,stepfunctions]>=5.0
+pytest>=8.0
